@@ -1,0 +1,5 @@
+numpy==1.26.0
+opencv-python==4.8.1.78
+pandas==2.2.1
+seaborn==0.13.2
+pyserial==3.5
