@@ -4,17 +4,25 @@ from os import path
 import time
 import sys
 import warnings
+import argparse
+
+import serial
+import serial.tools.list_ports
 
 import eBUS as eb
 import cv2
 
+# could maybe import * from common but you know
 from common.chunk_parser import decode_chunk
 from common.connection import init_bottlenose, deinit_bottlenose
 from common.draw_bboxes import draw_bounding_boxes
+from common.distance_estimator import first_distance_estimator, calibrated_img_dist_estimator
+from common.notification import connect_to_arduino, send_command, command_selector
 
 
-def handle_buffer(pvbuffer, device, file):
+def handle_buffer(pvbuffer, device):
     payload_type = pvbuffer.GetPayloadType()
+
     if payload_type == eb.PvPayloadTypeImage:
         image = pvbuffer.GetImage()
         image_data = image.GetDataPointer()
@@ -24,22 +32,14 @@ def handle_buffer(pvbuffer, device, file):
         # Draw any bounding boxes found
         if bounding_boxes is not None:
             draw_bounding_boxes(image_data, bounding_boxes)
-            # gathering data for distance estimation by pixelcount
-            # for bbox in bounding_boxes:
-            #     if bbox.label == "car":
-            #         width = bbox.right - bbox.left
-            #         height = bbox.bottom - bbox.top
-            #         line = bbox.label + "," + str(width) + "," + str(height) + "," + str(bbox.score)
-            #         file.write(line + "\n")
 
         # Bottlenose sends as YUV422
         if image.GetPixelType() == eb.PvPixelYUV422_8:
             image_data = cv2.cvtColor(image_data, cv2.COLOR_YUV2BGR_YUY2)
 
             cv2.imshow("Detections", image_data)
-            cv2.imwrite("./calibration/chessboard/calib_img1.jpg", image_data)
 
-        return bounding_boxes
+        return bounding_boxes, image_data
 
 
 def read_calibration(file_name):
@@ -156,18 +156,24 @@ def upload_weights(device, file_name):
     weights_update.SetValue(False)
 
 
-def configure_camera(device):
+def configure_camera(device, outside=True):
     """
     Configure camera settings, namely resolution and colour profile
+    :param outside: outdoors? touching grass? it could happen
     :param device: The device to enable bounding box streaming for
     """
-
+    # set resolution to 1080p (to reduce compute time for nn)
     height = device.GetParameters().Get("Height")
     height.SetValue(720)
 
-    # TODO -- ensure exposure ~ 0.5s for outdoor use, gain also = 1
-    exposure = None
-    gain = None
+    exposure = device.GetParameters().Get("exposure")
+    if outside:
+        exposure.SetValue(0.5)
+    else:
+        exposure.SetValue(25)
+
+    gain = device.GetParameters().Get("gain")
+    gain.SetValue(1)
 
     # TODO - potential colour profile work???
 
@@ -210,14 +216,14 @@ def configure_model(device, confidence=0.2):
     dnn_debug.SetValue(False)
 
 
-def run_stream(device, stream, weights_file, calibration_file, nn_depth):
+def run_stream(device, stream, weights_file, calibration_file, args):
     """
     Run the demo
     :param device: The device to stream from
     :param stream: The stream to use for streaming
     :param weights_file: The path to the AI model weights file to upload.
     :param calibration_file: The path to the file to calibrate the camera, undistorting images
-    :param nn_depth: Boolean parameter stating whether AI model does depth estimation or not
+    :param args: other parameters for running various code functions are in here
     """
     # Get device parameters need to control streaming
     device_params = device.GetParameters()
@@ -244,24 +250,43 @@ def run_stream(device, stream, weights_file, calibration_file, nn_depth):
     configure_model(device)
 
     # return bounding box dimensions for calculating distance
-    f = open("bboxdata/log_3m_distance_3ft_over_person.txt", "w")
-    f.write("label, width, height, score\n")
+    # f = open("bboxdata/log_3m_distance_3ft_over_person.txt", "w")
+    # f.write("label, width, height, score\n")
+
+    ser = connect_to_arduino(args.alerts)
 
     # Enable streaming and send the AcquisitionStart command
     device.StreamEnable()
     start.Execute()
 
+    history = [True, False, False]
     while True:
         # Retrieve next pvbuffer
         result, pvbuffer, operational_result = stream.RetrieveBuffer(1000)
+        bboxes, img_data = None, None
         if result.IsOK():
             if operational_result.IsOK():
                 # We now have a valid buffer.
-                handle_buffer(pvbuffer, device, f)
+                bboxes, img_data = handle_buffer(pvbuffer, device)
+
+                if calibration_file:
+                    if args.nndepth:
+                        est_dist = None
+                    else:
+                        est_dist = calibrated_img_dist_estimator(bboxes)
+                else:
+                    est_dist, _ = first_distance_estimator(bboxes)
+
+                if args.alerts:
+                    history = command_selector(est_dist, ser, history)
+
+                if args.data_collection:
+                    pass
+
                 if cv2.waitKey(1) & 0xFF != 0xFF:
                     break
             else:
-                # Non OK operational result
+                # Non-OK operational result
                 warnings.warn(f"Operational result error. {operational_result.GetCodeString()} "
                               f"({operational_result.GetDescription()})",
                               RuntimeWarning)
@@ -272,32 +297,25 @@ def run_stream(device, stream, weights_file, calibration_file, nn_depth):
             warnings.warn(f"Unable to retrieve buffer. {result.GetCodeString()} ({result.GetDescription()})",
                           RuntimeWarning)
 
-    # close file
-    f.close()
-
     # Tell the Bottlenose to stop sending images.
     stop.Execute()
     cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':
-    mac_address = None
-    weights_file = None
-    calibration_file = None
-    nn_depth = False
+    parser = argparse.ArgumentParser(description="For your SafeCycling needs")
 
-    # TODO - should probably change to argparse
-    if len(sys.argv) >= 2:
-        weights_file = sys.argv[1]
-    if len(sys.argv) >= 3:
-        mac_address = sys.argv[2]
-    if len(sys.argv) >= 4:
-        nn_depth = int(sys.argv[4]) >= 1
-    if len(sys.argv) >= 5:
-        calibration_file = sys.argv[3]
+    parser.add_argument("-wf", "--weights-file", type=str)
+    parser.add_argument("-cf", "--calibration-file", type=str)
+    parser.add_argument("-mac", "--mac-address", type=str)
+    parser.add_argument("-a", "--alerts", action="store_true")
+    parser.add_argument("-nnd", "--nn-depth", action="store_true")
+    parser.add_argument("-data", "--data-collection", action="store_true")
 
-    device, stream, buffers = init_bottlenose(mac_address)
+    args = parser.parse_args()
+
+    device, stream, buffers = init_bottlenose(args.mac_address)
     if device is not None:
-        run_stream(device, stream, weights_file, calibration_file, nn_depth)
+        run_stream(device, stream, args.weights_file, args.calibration_file, args)
 
     deinit_bottlenose(device, stream, buffers)
