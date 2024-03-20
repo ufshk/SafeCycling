@@ -2,15 +2,13 @@ import ftplib
 import ipaddress
 from os import path
 import time
-import sys
 import warnings
 import argparse
-
-import serial
-import serial.tools.list_ports
+import yaml
 
 import eBUS as eb
 import cv2
+import numpy as np
 
 # could maybe import * from common but you know
 from common.chunk_parser import decode_chunk
@@ -42,14 +40,98 @@ def handle_buffer(pvbuffer, device):
         return bounding_boxes, image_data
 
 
-def read_calibration(file_name):
+def rodrigues(matrix):
+    epsilon = 1e-8  # Small value to handle division by zero
+
+    # Extract the matrix components
+    R = np.array(matrix)
+    R_trace = np.trace(R)
+    R_diff = R - R.T
+
+    # Calculate the angle and axis of rotation
+    theta = np.arccos((R_trace - 1) / 2)
+    axis = np.array([R_diff[2, 1], R_diff[0, 2], R_diff[1, 0]])
+
+    # Normalize the axis
+    norm_axis = np.linalg.norm(axis)
+    if norm_axis < epsilon:
+        # Handle the case when norm_axis is close to zero
+        return np.zeros(3)
+
+    axis /= norm_axis
+
+    # Convert the axis-angle representation to a rotation vector
+    rotation_vector = theta * axis
+
+    return rotation_vector
+
+
+def read_calibration(fname, sensors=0):
     """
     Load the contents of calibration file into a dictionary
-    :param file_name:
+    :param sensors:
+    :param fname:
     :return:
     """
-    # TODO
-    return dict()
+    kdata = {}
+
+    if not path.isfile(fname) or (
+                    not fname.lower().endswith(".yaml") and
+                    not fname.lower().endswith(".yml")):
+        return kdata
+    if sensors == 0:
+        return kdata
+
+    try:
+        with open(fname, "r") as f:
+            kalibr = yaml.safe_load(f)
+
+        nCameras = len(kalibr.keys())
+        if nCameras != sensors:
+            return kdata
+
+        for cam in kalibr.keys():
+            cam_model = kalibr[cam]["camera_model"]
+            if cam_model != 'pinhole' or cam not in ['cam0', 'cam1']:
+                return kdata.clear()
+
+            id = cam[-1]
+            fu, fv, pu, pv = kalibr[cam]["intrinsics"]
+            kdata["fx" + id] = fu
+            kdata["fy" + id] = fv
+            kdata["cx" + id] = pu
+            kdata["cy" + id] = pv
+
+            dist = kalibr[cam]["distortion_coeffs"]
+            kdata["k1" + id] = dist[0]
+            kdata["k2" + id] = dist[1]
+            kdata["p1" + id] = dist[2]
+            kdata["p2" + id] = dist[2]
+            kdata["k3" + id] = 0.0
+
+            if 'T_cn_cnm1' in kalibr[cam].keys():
+                T_01 = np.linalg.inv(np.array(kalibr[cam]["T_cn_cnm1"]))
+                R = T_01[:3, :3]
+                tvec = T_01[:3, 3]
+                rvec = rodrigues(R)
+            else:
+                rvec = tvec = [0.0, 0.0, 0.0]
+
+            kdata["tx" + id] = tvec[0]
+            kdata["ty" + id] = tvec[1]
+            kdata["tz" + id] = tvec[2]
+            kdata["rx" + id] = rvec[0]
+            kdata["ry" + id] = rvec[1]
+            kdata["rz" + id] = rvec[2]
+
+            width, height = kalibr[cam]["resolution"]
+            kdata["kWidth"] = width
+            kdata["kHeight"] = height
+
+    except Exception:
+        return kdata.clear()
+
+    return kdata
 
 
 def __set_register(device, regname, regvalue):
@@ -241,7 +323,7 @@ def run_stream(device, stream, weights_file, calibration_file, args):
         upload_weights(device, weights_file)
 
     # Configure the camera
-    configure_camera(device)
+    configure_camera(device, args.outside)
 
     # Enable chunk data transfer for bounding boxes
     enable_bounding_boxes(device)
@@ -259,7 +341,7 @@ def run_stream(device, stream, weights_file, calibration_file, args):
     device.StreamEnable()
     start.Execute()
 
-    history = [True, False, False]
+    history = [False, False, False, 0]
     while True:
         # Retrieve next pvbuffer
         result, pvbuffer, operational_result = stream.RetrieveBuffer(1000)
@@ -311,6 +393,7 @@ if __name__ == '__main__':
     parser.add_argument("-a", "--alerts", action="store_true")
     parser.add_argument("-nnd", "--nn-depth", action="store_true")
     parser.add_argument("-data", "--data-collection", action="store_true")
+    parser.add_argument("-o", "--outside", action="store_true")
 
     args = parser.parse_args()
 
