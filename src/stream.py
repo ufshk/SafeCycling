@@ -9,13 +9,16 @@ import yaml
 import eBUS as eb
 import cv2
 import numpy as np
+import pandas as pd
 
 # could maybe import * from common but you know
 from common.chunk_parser import decode_chunk
 from common.connection import init_bottlenose, deinit_bottlenose
 from common.draw_bboxes import draw_bounding_boxes
-from common.distance_estimator import first_distance_estimator, calibrated_img_dist_estimator
-from common.notification import connect_to_arduino, send_command, command_selector
+from common.distance_estimator import dist_estimator, load_model
+from common.notification import connect_to_arduino, command_selector
+from common.data_collection import bounding_box_data_collector, testing_data_collector
+from timeit import default_timer as timer
 
 
 def handle_buffer(pvbuffer, device):
@@ -76,8 +79,8 @@ def read_calibration(fname, sensors=0):
     kdata = {}
 
     if not path.isfile(fname) or (
-                    not fname.lower().endswith(".yaml") and
-                    not fname.lower().endswith(".yml")):
+            not fname.lower().endswith(".yaml") and
+            not fname.lower().endswith(".yml")):
         return kdata
     if sensors == 0:
         return kdata
@@ -169,7 +172,7 @@ def upload_calibration(device, file_name):
 
     res = __set_register(device, "saveCalibrationData", 1)
 
-    return res.IsOK()
+    return res
 
 
 def upload_weights(device, file_name):
@@ -250,12 +253,15 @@ def configure_camera(device, outside=True):
 
     exposure = device.GetParameters().Get("exposure")
     if outside:
-        exposure.SetValue(0.5)
+        exposure.SetValue(0.1)
     else:
         exposure.SetValue(25)
 
     gain = device.GetParameters().Get("gain")
     gain.SetValue(1)
+
+    wbAuto = device.GetParameters().Get("wbAuto")
+    wbAuto.SetValue(True)
 
     # TODO - potential colour profile work???
 
@@ -316,7 +322,9 @@ def run_stream(device, stream, weights_file, calibration_file, args):
 
     # Calibration values for undistorted images
     if calibration_file is not None:
-        upload_calibration(device, calibration_file)
+        res = upload_calibration(device, calibration_file)
+        if not res:
+            print("Calibration failed!")
 
     # Enable keypoint detection and streaming
     if weights_file is not None:
@@ -342,6 +350,44 @@ def run_stream(device, stream, weights_file, calibration_file, args):
     start.Execute()
 
     history = [False, False, False, 0]
+
+    df = None
+    objclasses = ["car"]
+    fname = None
+    if args.data_collection:
+        # data collection for determining distance estimation algorithm
+        vehicle_ = "sedan"
+        angle_ = 30
+        dist_ = 9
+        df = pd.DataFrame(columns=['cid', 'label', 'left', 'right', 'top', 'bottom', 'width', 'height', 'score'])
+        name = f"{vehicle_}_car_angle_{angle_}_{dist_}m"
+        fname = f"~/Documents/SYDE/4B/Capstone/SafeCycling/src/data/collection/raw/{name}.csv"
+        df.to_csv(fname, mode='w', header=True)
+
+    test = None
+    test_f = None
+    vehicle = None
+    real_dist = None
+    start = None
+    if args.testing:
+        test = pd.DataFrame(columns=['cid', 'label', 'vehicle', 'left', 'right', 'top', 'bottom', 'width', 'height',
+                                     'score', 'distance_estimate', "angle_estimate", 'real_distance', "ratio",
+                                     "elapsed_time"])
+        real_dist = 22
+        vehicle = "van"
+        angle__ = 0
+        name = f"{vehicle}_{real_dist}m_{angle__}_angle_dyn_test6"
+        test_f = f"~/Documents/SYDE/4B/Capstone/SafeCycling/src/data/testing/iter{args.iteration}/{name}.csv"
+        test.to_csv(test_f, mode="w", header=True)
+
+        print("Start Driving!")
+        start = timer()
+
+    model = None
+    angle_model = None
+    if args.iteration != 1:
+        model, angle_model = load_model(args.iteration)
+
     while True:
         # Retrieve next pvbuffer
         result, pvbuffer, operational_result = stream.RetrieveBuffer(1000)
@@ -351,19 +397,18 @@ def run_stream(device, stream, weights_file, calibration_file, args):
                 # We now have a valid buffer.
                 bboxes, img_data = handle_buffer(pvbuffer, device)
 
-                if calibration_file:
-                    if args.nndepth:
-                        est_dist = None
-                    else:
-                        est_dist = calibrated_img_dist_estimator(bboxes)
-                else:
-                    est_dist, _ = first_distance_estimator(bboxes)
+                est_dist, est_angle, ratio = dist_estimator(bboxes, args.iteration, model, angle_model)
 
                 if args.alerts:
                     history = command_selector(est_dist, ser, history)
 
                 if args.data_collection:
-                    pass
+                    df = bounding_box_data_collector(bboxes, objclasses, df)
+                    df.to_csv(fname, mode='a', header=False)
+
+                if args.testing:
+                    test = testing_data_collector(bboxes, est_dist, real_dist, est_angle, vehicle, test, ratio, start)
+                    test.to_csv(test_f, mode='a', header=False)
 
                 if cv2.waitKey(1) & 0xFF != 0xFF:
                     break
@@ -394,6 +439,8 @@ if __name__ == '__main__':
     parser.add_argument("-nnd", "--nn-depth", action="store_true")
     parser.add_argument("-data", "--data-collection", action="store_true")
     parser.add_argument("-o", "--outside", action="store_true")
+    parser.add_argument("-t", "--testing", action="store_true")
+    parser.add_argument("-i", "--iteration", type=int, default=1, choices=range(1, 4))
 
     args = parser.parse_args()
 

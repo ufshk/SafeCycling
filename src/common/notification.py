@@ -74,7 +74,7 @@ def command_selector(dist, ser, history):
             history[0] = True
             print("Sent H")
     elif 5 <= dist < 10:
-        if history[1] or (history[3] < 8 and history[0]):
+        if history[1] or (history[3] < 5 and history[0]):
             history[3] += 1
             pass
         else:
@@ -83,7 +83,7 @@ def command_selector(dist, ser, history):
             history[1] = True
             print("Sent M")
     else:
-        if history[2] or history[3] < 8:
+        if history[2] or history[3] < 5:
             history[3] += 1
             pass
         else:
